@@ -102,9 +102,16 @@ final class PageTracker {
                 dictionary = ChunkDictionary.preloaded(u.plan().preloaded()[c]);
             }
             else if (u.plan().dictionaryStart()[c] > 0) {
-                dictionary = new ChunkDictionary();
                 int length = Math.toIntExact(u.plan().firstDataPage()[c] - u.plan().dictionaryStart()[c]);
-                addDictionaryPage(new TrackedPage(u, c, firstKey, NeededPage.dictionary(u.plan().dictionaryStart()[c], length),
+                Exception tooLarge = tooLarge(u, c, length, ExceptionContext.DICTIONARY_PAGE, "Dictionary page");
+                if (tooLarge != null) {
+                    // its data pages cannot decode without it, so none of the chunk is read
+                    readFailure.failAt(firstKey, c, tooLarge);
+                    continue;
+                }
+                dictionary = new ChunkDictionary();
+                addDictionaryPage(new TrackedPage(u, c, firstKey,
+                        NeededPage.dictionary(u.plan().dictionaryStart()[c], length),
                         overlapping(ranges, keys, firstKey, u.plan().dictionaryStart()[c], length), dictionary, false));
             }
             reportPagesLocated(u.listing().file().name(), u.listing().rowGroup(), columns.schema(c), needed.size(),
@@ -112,6 +119,13 @@ final class PageTracker {
             for (NeededPage page : needed) {
                 int length = page.location().compressedPageSize();
                 long key = u.key(page.location().firstRowIndex());
+                // refused before it lowers its ranges' keys, so that a range only it or the
+                // chunk's later pages read is keyed past the failure and never fetched
+                Exception tooLarge = tooLarge(u, c, length, page.pageIndex(), "Data page");
+                if (tooLarge != null) {
+                    readFailure.failAt(key, c, tooLarge);
+                    break;
+                }
                 add(placement, new TrackedPage(u, c, key, page,
                         overlapping(ranges, keys, key, page.location().offset(), length), dictionary, true));
             }
@@ -161,6 +175,38 @@ final class PageTracker {
         hold(tracked);
         cells.add(tracked.column(), placement, tracked);
         decodeWhenReady(tracked);
+    }
+
+    /// Whether `tracked`, a page a header scan found, is refused for storing more bytes than the
+    /// read's working-set limit ([#tooLarge]), checked before the scan keys its ranges to it and
+    /// adds it: the read fails at the page, which is never added and holds no range, and a refused
+    /// dictionary page fails its chunk's dictionary, which the chunk's data pages wait on.
+    boolean refused(TrackedPage tracked) {
+        Exception tooLarge = tooLarge(tracked.unit(), tracked.column(), tracked.page().location().compressedPageSize(),
+                tracked.data() ? tracked.page().pageIndex() : ExceptionContext.DICTIONARY_PAGE,
+                tracked.data() ? "Data page" : "Dictionary page");
+        if (tooLarge == null) {
+            return false;
+        }
+        readFailure.failAt(tracked.key(), tracked.column(), tooLarge);
+        if (!tracked.data()) {
+            tracked.dictionary().output().failed(tooLarge);
+        }
+        return true;
+    }
+
+    /// The failure of a page of `column` in `u` storing `stored` bytes, where they alone exceed the
+    /// read's working-set limit ([WorkingSet.Column#requireStorable]); `null` where they do not. A
+    /// page of a planned chunk is checked before its ranges are keyed to it, and one a scan finds
+    /// before the scan keys them ([#refused]).
+    private Exception tooLarge(Unit.Batched u, int column, long stored, int pageIndex, String what) {
+        try {
+            columns.workingSet(column).requireStorable(stored, what);
+            return null;
+        }
+        catch (ParquetReadException e) {
+            return columns.withContext(column, e, u.listing().file().name(), u.listing().rowGroup(), pageIndex);
+        }
     }
 
     /// Places the pages `column` can place, ending each flat page's placement, which its decode waits
